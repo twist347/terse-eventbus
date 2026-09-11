@@ -1,4 +1,4 @@
-#include "eb/event_bus.h"
+#include "teb/event_bus.h"
 
 #include <assert.h>
 #include <stdlib.h>
@@ -6,8 +6,8 @@
 
 /* ========== internal ========== */
 
-#define TYPE_IS_VALID(bus, t) \
-    ((t) >= 0 && (size_t) (t) < (bus)->event_type_count)
+#define TYPE_IS_VALID(self, t) \
+    ((t) >= 0 && (size_t) (t) < (self)->type_count)
 
 // Removal model: tombstones.
 //
@@ -18,55 +18,55 @@
 // Invariants:
 //   * len is the used-slot border, NOT the number of live handlers;
 //   * dispatch_depth == 0  =>  total_dead == 0, i.e. the array is dense
-//     outside a dispatch, so eb_subscribe may simply append;
+//     outside a dispatch, so teb_event_bus_subscribe may simply append;
 //   * a dispatch loop fixes its upper bound before calling anything, so a
 //     subscription appended during dispatch cannot see the event in flight;
 //   * slots in [len, cap) are zeroed and never read.
 //
-// Growth: eb_subscribe may realloc from inside a handler, so any Subscription *
-// taken before a call into user code is dangling afterwards. Index the vector
-// instead of holding a pointer across such a call.
+// Growth: teb_event_bus_subscribe may realloc from inside a handler, so any
+// Subscription * taken before a call into user code is dangling afterwards.
+// Index the vector instead of holding a pointer across such a call.
 
-static bool grow(eb_EventBus *bus, eb_EventType type);
+static bool grow(teb_EventBus *self, teb_EventType type);
 
-static void mark_dead(eb_EventBus *bus, eb_EventType type, size_t idx);
+static void mark_dead(teb_EventBus *self, teb_EventType type, size_t idx);
 
-static void compact_type(eb_EventBus *bus, eb_EventType type);
+static void compact_type(teb_EventBus *self, teb_EventType type);
 
-static void compact_all(eb_EventBus *bus);
+static void compact_all(teb_EventBus *self);
 
-static bool queue_alloc(eb_EventBus *bus);
+static bool queue_alloc(teb_EventBus *self);
 
 /* ========== event ========== */
 
-struct eb_Event {
-    eb_EventType type;
+struct teb_Event {
+    teb_EventType type;
     const void *data;
     size_t data_size;
 };
 
-eb_EventType eb_ev_type(const eb_Event *ev) {
-    assert(ev);
+teb_EventType teb_event_type(const teb_Event *self) {
+    assert(self);
 
-    return ev->type;
+    return self->type;
 }
 
-const void *eb_ev_data(const eb_Event *ev) {
-    assert(ev);
+const void *teb_event_data(const teb_Event *self) {
+    assert(self);
 
-    return ev->data;
+    return self->data;
 }
 
-size_t eb_ev_data_size(const eb_Event *ev) {
-    assert(ev);
+size_t teb_event_data_size(const teb_Event *self) {
+    assert(self);
 
-    return ev->data_size;
+    return self->data_size;
 }
 
 /* ========== event bus ========== */
 
 typedef struct {
-    eb_EventHandler handler;
+    teb_EventHandler handler;
     void *ctx;
 } Subscription;
 
@@ -79,7 +79,7 @@ typedef struct {
 } SubscriptionVec;
 
 typedef struct {
-    eb_EventType type;
+    teb_EventType type;
     size_t data_size;
 } PostHeader;
 
@@ -88,7 +88,7 @@ typedef struct {
 // payload size is chosen at run time, so a slot cannot be one struct. The
 // payload base comes from malloc and the stride is a multiple of max_align_t,
 // which is what lands every slot aligned for whatever type was posted -- the
-// alignment EB_EV_EXPECT asserts on.
+// alignment TEB_EVENT_EXPECT asserts on.
 //
 // Neither array is resized, so unlike SubscriptionVec they never move and a
 // slot stays put across a call into user code.
@@ -102,8 +102,8 @@ typedef struct {
     size_t stride;    // slot_size rounded up to max_align_t
 } PostQueue;
 
-struct eb_EventBus {
-    size_t event_type_count;
+struct teb_EventBus {
+    size_t type_count;
     SubscriptionVec *subs;
     size_t total_dead;
     size_t dispatch_depth;
@@ -111,12 +111,12 @@ struct eb_EventBus {
     bool draining;
 };
 
-eb_EventBus *eb_bus_create(size_t event_type_count) {
-    return eb_bus_create_ex(event_type_count, EB_DEFAULT_POST_PAYLOAD, EB_DEFAULT_POST_QUEUE_CAP);
+teb_EventBus *teb_event_bus_new(size_t type_count) {
+    return teb_event_bus_new_cap(type_count, TEB_DEFAULT_POST_SLOT_SIZE, TEB_DEFAULT_POST_QUEUE_CAP);
 }
 
-eb_EventBus *eb_bus_create_ex(size_t event_type_count, size_t post_slot_size, size_t post_queue_cap) {
-    assert(event_type_count > 0);
+teb_EventBus *teb_event_bus_new_cap(size_t type_count, size_t post_slot_size, size_t post_queue_cap) {
+    assert(type_count > 0);
     assert(post_queue_cap > 0); // a feature is not switched off by sizing it to zero
 
     constexpr size_t align = alignof(max_align_t);
@@ -135,95 +135,95 @@ eb_EventBus *eb_bus_create_ex(size_t event_type_count, size_t post_slot_size, si
         return nullptr;
     }
 
-    eb_EventBus *bus = malloc(sizeof(eb_EventBus));
-    if (!bus) {
+    teb_EventBus *obj = malloc(sizeof(teb_EventBus));
+    if (!obj) {
         return nullptr;
     }
 
     // every vector starts empty; storage is allocated on first subscribe
-    bus->event_type_count = event_type_count;
-    bus->subs = calloc(event_type_count, sizeof(*bus->subs));
-    bus->total_dead = 0;
-    bus->dispatch_depth = 0;
+    obj->type_count = type_count;
+    obj->subs = calloc(type_count, sizeof(*obj->subs));
+    obj->total_dead = 0;
+    obj->dispatch_depth = 0;
 
     // the queue buffers are allocated on the first post, not here
-    bus->queue = (PostQueue){.cap = post_queue_cap, .slot_size = post_slot_size, .stride = stride};
-    bus->draining = false;
+    obj->queue = (PostQueue){.cap = post_queue_cap, .slot_size = post_slot_size, .stride = stride};
+    obj->draining = false;
 
-    if (!bus->subs) {
-        free(bus);
+    if (!obj->subs) {
+        free(obj);
         return nullptr;
     }
-    return bus;
+    return obj;
 }
 
-void eb_bus_destroy(eb_EventBus *bus) {
-    if (!bus) {
+void teb_event_bus_drop(teb_EventBus *self) {
+    if (!self) {
         return;
     }
-    for (size_t t = 0; t < bus->event_type_count; ++t) {
-        free(bus->subs[t].data);
+    for (size_t t = 0; t < self->type_count; ++t) {
+        free(self->subs[t].data);
     }
-    free(bus->subs);
-    free(bus->queue.headers);
-    free(bus->queue.payloads);
-    free(bus);
+    free(self->subs);
+    free(self->queue.headers);
+    free(self->queue.payloads);
+    free(self);
 }
 
-void eb_bus_reset(eb_EventBus *bus) {
-    assert(bus);
-    assert(bus->dispatch_depth == 0); // implies no drain is in flight either
+void teb_event_bus_clear(teb_EventBus *self) {
+    assert(self);
+    assert(self->dispatch_depth == 0); // implies no drain is in flight either
 
-    for (size_t t = 0; t < bus->event_type_count; ++t) {
-        SubscriptionVec *v = &bus->subs[t];
+    for (size_t t = 0; t < self->type_count; ++t) {
+        SubscriptionVec *v = &self->subs[t];
         if (v->len > 0) {
             memset(v->data, 0, v->len * sizeof(*v->data));
         }
         v->len = 0;
         v->dead = 0;
     }
-    bus->total_dead = 0;
+    self->total_dead = 0;
 
     // queued events go too; the queue keeps its allocation
-    bus->queue.head = 0;
-    bus->queue.count = 0;
+    self->queue.head = 0;
+    self->queue.count = 0;
 }
 
-bool eb_bus_reserve(eb_EventBus *bus, eb_EventType type, size_t n) {
-    assert(bus);
+bool teb_event_bus_reserve(teb_EventBus *self, teb_EventType type, size_t cap) {
+    assert(self);
 
-    if (!TYPE_IS_VALID(bus, type)) {
+    if (!TYPE_IS_VALID(self, type)) {
         return false;
     }
 
-    SubscriptionVec *v = &bus->subs[type];
-    if (n <= v->cap) {
+    SubscriptionVec *v = &self->subs[type];
+    if (cap <= v->cap) {
         return true;
     }
 
-    if (n > SIZE_MAX / sizeof(*v->data)) {
+    if (cap > SIZE_MAX / sizeof(*v->data)) {
         return false;
     }
 
-    Subscription *data = realloc(v->data, n * sizeof(*data));
+    Subscription *data = realloc(v->data, cap * sizeof(*data));
     if (!data) {
         return false;
     }
 
-    memset(&data[v->cap], 0, (n - v->cap) * sizeof(*data));
+    memset(&data[v->cap], 0, (cap - v->cap) * sizeof(*data));
     v->data = data;
-    v->cap = n;
+    v->cap = cap;
 
     return true;
 }
 
-void eb_bus_shrink_to_fit(eb_EventBus *bus) {
-    assert(bus);
-    assert(bus->dispatch_depth == 0);
-    assert(bus->total_dead == 0); // dense outside a dispatch, so len == live
+void teb_event_bus_shrink_to_fit(teb_EventBus *self) {
+    assert(self);
+    assert(self->dispatch_depth == 0);
+    assert(self->total_dead == 0); // dense outside a dispatch, so len == live
 
-    for (size_t t = 0; t < bus->event_type_count; ++t) {
-        SubscriptionVec *v = &bus->subs[t];
+    for (size_t t = 0; t < self->type_count; ++t) {
+        SubscriptionVec *v = &self->subs[t];
         if (v->len == v->cap) {
             continue;
         }
@@ -245,15 +245,15 @@ void eb_bus_shrink_to_fit(eb_EventBus *bus) {
 
 /* ========== event bus subs ========== */
 
-bool eb_subscribe(eb_EventBus *bus, eb_EventType type, eb_EventHandler handler, void *ctx) {
-    assert(bus);
+bool teb_event_bus_subscribe(teb_EventBus *self, teb_EventType type, teb_EventHandler handler, void *ctx) {
+    assert(self);
     assert(handler);
 
-    if (!TYPE_IS_VALID(bus, type)) {
+    if (!TYPE_IS_VALID(self, type)) {
         return false;
     }
 
-    SubscriptionVec *v = &bus->subs[type];
+    SubscriptionVec *v = &self->subs[type];
 
     // forbid duplicates; dead slots hold handler == nullptr and never match
     const size_t n = v->len;
@@ -265,7 +265,7 @@ bool eb_subscribe(eb_EventBus *bus, eb_EventType type, eb_EventHandler handler, 
 
     // append only: reusing a dead slot would expose the new handler to a
     // dispatch already in flight
-    if (n == v->cap && !grow(bus, type)) {
+    if (n == v->cap && !grow(self, type)) {
         return false;
     }
 
@@ -277,21 +277,21 @@ bool eb_subscribe(eb_EventBus *bus, eb_EventType type, eb_EventHandler handler, 
     return true;
 }
 
-bool eb_unsubscribe(eb_EventBus *bus, eb_EventType type, eb_EventHandler handler, void *ctx) {
-    assert(bus);
+bool teb_event_bus_unsubscribe(teb_EventBus *self, teb_EventType type, teb_EventHandler handler, void *ctx) {
+    assert(self);
     assert(handler);
 
-    if (!TYPE_IS_VALID(bus, type)) {
+    if (!TYPE_IS_VALID(self, type)) {
         return false;
     }
 
-    SubscriptionVec *v = &bus->subs[type];
+    SubscriptionVec *v = &self->subs[type];
     const size_t n = v->len;
     for (size_t i = 0; i < n; ++i) {
         if (v->data[i].handler == handler && v->data[i].ctx == ctx) {
-            mark_dead(bus, type, i);
-            if (bus->dispatch_depth == 0) {
-                compact_type(bus, type);
+            mark_dead(self, type, i);
+            if (self->dispatch_depth == 0) {
+                compact_type(self, type);
             }
             return true;
         }
@@ -300,98 +300,98 @@ bool eb_unsubscribe(eb_EventBus *bus, eb_EventType type, eb_EventHandler handler
     return false;
 }
 
-void eb_unsubscribe_by_type(eb_EventBus *bus, eb_EventType type) {
-    assert(bus);
+void teb_event_bus_unsubscribe_type(teb_EventBus *self, teb_EventType type) {
+    assert(self);
 
-    if (!TYPE_IS_VALID(bus, type)) {
+    if (!TYPE_IS_VALID(self, type)) {
         return;
     }
 
-    SubscriptionVec *v = &bus->subs[type];
+    SubscriptionVec *v = &self->subs[type];
     const size_t n = v->len;
     for (size_t i = 0; i < n; ++i) {
         if (v->data[i].handler) {
-            mark_dead(bus, type, i);
+            mark_dead(self, type, i);
         }
     }
 
-    if (bus->dispatch_depth == 0) {
-        compact_type(bus, type);
+    if (self->dispatch_depth == 0) {
+        compact_type(self, type);
     }
 }
 
-size_t eb_unsubscribe_by_ctx(eb_EventBus *bus, const void *ctx) {
-    assert(bus);
+size_t teb_event_bus_unsubscribe_ctx(teb_EventBus *self, const void *ctx) {
+    assert(self);
 
     size_t removed = 0;
-    for (size_t t = 0; t < bus->event_type_count; ++t) {
-        SubscriptionVec *v = &bus->subs[t];
+    for (size_t t = 0; t < self->type_count; ++t) {
+        SubscriptionVec *v = &self->subs[t];
         const size_t n = v->len;
         for (size_t i = 0; i < n; ++i) {
             if (v->data[i].handler && v->data[i].ctx == ctx) {
-                mark_dead(bus, (eb_EventType) t, i);
+                mark_dead(self, (teb_EventType) t, i);
                 ++removed;
             }
         }
     }
 
-    if (bus->dispatch_depth == 0) {
-        compact_all(bus);
+    if (self->dispatch_depth == 0) {
+        compact_all(self);
     }
     return removed;
 }
 
-size_t eb_unsubscribe_by_handler(eb_EventBus *bus, eb_EventHandler handler) {
-    assert(bus);
+size_t teb_event_bus_unsubscribe_handler(teb_EventBus *self, teb_EventHandler handler) {
+    assert(self);
     assert(handler);
 
     size_t removed = 0;
-    for (size_t t = 0; t < bus->event_type_count; ++t) {
-        SubscriptionVec *v = &bus->subs[t];
+    for (size_t t = 0; t < self->type_count; ++t) {
+        SubscriptionVec *v = &self->subs[t];
         const size_t n = v->len;
         for (size_t i = 0; i < n; ++i) {
             if (v->data[i].handler == handler) {
-                mark_dead(bus, (eb_EventType) t, i);
+                mark_dead(self, (teb_EventType) t, i);
                 ++removed;
             }
         }
     }
 
-    if (bus->dispatch_depth == 0) {
-        compact_all(bus);
+    if (self->dispatch_depth == 0) {
+        compact_all(self);
     }
     return removed;
 }
 
-size_t eb_count_subscribers(const eb_EventBus *bus, eb_EventType type) {
-    assert(bus);
+size_t teb_event_bus_count_subscribers(const teb_EventBus *self, teb_EventType type) {
+    assert(self);
 
-    if (!TYPE_IS_VALID(bus, type)) {
+    if (!TYPE_IS_VALID(self, type)) {
         return 0;
     }
 
     // dead slots sit inside the border, so the difference is exact and O(1)
-    return bus->subs[type].len - bus->subs[type].dead;
+    return self->subs[type].len - self->subs[type].dead;
 }
 
 /* ========== event bus publish ========== */
 
-bool eb_publish_data(eb_EventBus *bus, eb_EventType type, const void *data, size_t data_size) {
-    assert(bus);
+bool teb_event_bus_publish_data(teb_EventBus *self, teb_EventType type, const void *data, size_t data_size) {
+    assert(self);
     assert((data == nullptr) == (data_size == 0));
 
-    if (!TYPE_IS_VALID(bus, type)) {
+    if (!TYPE_IS_VALID(self, type)) {
         return false;
     }
 
-    if (bus->dispatch_depth >= EB_MAX_DISPATCH_DEPTH) {
-        assert(0 && "eb_publish_data: dispatch depth limit exceeded");
+    if (self->dispatch_depth >= TEB_MAX_DISPATCH_DEPTH) {
+        assert(0 && "teb_event_bus_publish_data: dispatch depth limit exceeded");
         return false;
     }
 
-    const eb_Event ev = {.type = type, .data = data, .data_size = data_size};
+    const teb_Event ev = {.type = type, .data = data, .data_size = data_size};
 
-    SubscriptionVec *v = &bus->subs[ev.type];
+    SubscriptionVec *v = &self->subs[ev.type];
 
     // fixed before any handler runs: subscriptions appended during dispatch
     // stay out of this event
@@ -400,7 +400,7 @@ bool eb_publish_data(eb_EventBus *bus, eb_EventType type, const void *data, size
         return true;
     }
 
-    ++bus->dispatch_depth;
+    ++self->dispatch_depth;
     for (size_t i = 0; i < n; ++i) {
         // re-read the slot every iteration and copy it out: a handler may kill
         // itself or a peer, and a subscribe from inside one may have moved the
@@ -409,41 +409,41 @@ bool eb_publish_data(eb_EventBus *bus, eb_EventType type, const void *data, size
         if (!s.handler) {
             continue;
         }
-        s.handler(&ev, bus, s.ctx);
+        s.handler(&ev, self, s.ctx);
     }
-    --bus->dispatch_depth;
+    --self->dispatch_depth;
 
-    if (bus->dispatch_depth == 0 && bus->total_dead > 0) {
-        compact_all(bus);
+    if (self->dispatch_depth == 0 && self->total_dead > 0) {
+        compact_all(self);
     }
 
     return true;
 }
 
-bool eb_publish(eb_EventBus *bus, eb_EventType type) {
-    assert(bus);
+bool teb_event_bus_publish(teb_EventBus *self, teb_EventType type) {
+    assert(self);
 
-    return eb_publish_data(bus, type, nullptr, 0);
+    return teb_event_bus_publish_data(self, type, nullptr, 0);
 }
 
 /* ========== event bus deferred publish ========== */
 
-bool eb_post_data(eb_EventBus *bus, eb_EventType type, const void *data, size_t data_size) {
-    assert(bus);
+bool teb_event_bus_post_data(teb_EventBus *self, teb_EventType type, const void *data, size_t data_size) {
+    assert(self);
     assert((data == nullptr) == (data_size == 0));
 
-    if (!TYPE_IS_VALID(bus, type)) {
+    if (!TYPE_IS_VALID(self, type)) {
         return false;
     }
 
-    PostQueue *q = &bus->queue;
+    PostQueue *q = &self->queue;
 
     if (data_size > q->slot_size) {
-        assert(0 && "eb_post_data: payload above this bus's post slot size");
+        assert(0 && "teb_event_bus_post_data: payload above this bus's post slot size");
         return false;
     }
 
-    if (!q->headers && !queue_alloc(bus)) {
+    if (!q->headers && !queue_alloc(self)) {
         return false;
     }
 
@@ -463,25 +463,25 @@ bool eb_post_data(eb_EventBus *bus, eb_EventType type, const void *data, size_t 
     return true;
 }
 
-bool eb_post(eb_EventBus *bus, eb_EventType type) {
-    assert(bus);
+bool teb_event_bus_post(teb_EventBus *self, teb_EventType type) {
+    assert(self);
 
-    return eb_post_data(bus, type, nullptr, 0);
+    return teb_event_bus_post_data(self, type, nullptr, 0);
 }
 
-size_t eb_drain(eb_EventBus *bus) {
-    assert(bus);
+size_t teb_event_bus_drain(teb_EventBus *self) {
+    assert(self);
 
     // a handler always runs at a non-zero depth, whichever path reached it, so
     // this rejects a drain nested in a publish and one nested in a drain alike
-    if (bus->dispatch_depth != 0) {
-        assert(0 && "eb_drain: called from inside a handler");
+    if (self->dispatch_depth != 0) {
+        assert(0 && "teb_event_bus_drain: called from inside a handler");
         return 0;
     }
 
-    PostQueue *q = &bus->queue;
+    PostQueue *q = &self->queue;
 
-    // fixed before any handler runs, mirroring eb_publish_data: a post made
+    // fixed before any handler runs, mirroring teb_event_bus_publish_data: a post made
     // during the drain waits for the next one, so two handlers posting to each
     // other cannot keep this loop alive
     const size_t n = q->count;
@@ -489,7 +489,7 @@ size_t eb_drain(eb_EventBus *bus) {
         return 0;
     }
 
-    bus->draining = true;
+    self->draining = true;
     for (size_t i = 0; i < n; ++i) {
         const PostHeader h = q->headers[q->head];
         const void *data = h.data_size > 0 ? q->payloads + q->head * q->stride : nullptr;
@@ -497,40 +497,40 @@ size_t eb_drain(eb_EventBus *bus) {
         // ev.data points into the slot, so the slot is released only after the
         // dispatch: freeing it first would let a post from one of these
         // handlers reuse it and overwrite the payload being read
-        (void) eb_publish_data(bus, h.type, data, h.data_size);
+        (void) teb_event_bus_publish_data(self, h.type, data, h.data_size);
 
         q->head = (q->head + 1) % q->cap;
         --q->count;
     }
-    bus->draining = false;
+    self->draining = false;
 
     return n;
 }
 
-void eb_drop_posted(eb_EventBus *bus) {
-    assert(bus);
+void teb_event_bus_clear_posted(teb_EventBus *self) {
+    assert(self);
 
     // dropping mid-drain would pull the slots out from under the loop. Depth is
     // not the test here: dropping from inside a plain publish harms nothing.
-    if (bus->draining) {
-        assert(0 && "eb_drop_posted: called from inside a drain");
+    if (self->draining) {
+        assert(0 && "teb_event_bus_clear_posted: called from inside a drain");
         return;
     }
 
-    bus->queue.head = 0;
-    bus->queue.count = 0;
+    self->queue.head = 0;
+    self->queue.count = 0;
 }
 
-size_t eb_count_posted(const eb_EventBus *bus) {
-    assert(bus);
+size_t teb_event_bus_count_posted(const teb_EventBus *self) {
+    assert(self);
 
-    return bus->queue.count;
+    return self->queue.count;
 }
 
 /* ========== internal ========== */
 
-static bool grow(eb_EventBus *bus, eb_EventType type) {
-    SubscriptionVec *v = &bus->subs[type];
+static bool grow(teb_EventBus *self, teb_EventType type) {
+    SubscriptionVec *v = &self->subs[type];
     assert(v->len == v->cap);
 
     const size_t old_cap = v->cap;
@@ -548,20 +548,20 @@ static bool grow(eb_EventBus *bus, eb_EventType type) {
     return true;
 }
 
-static void mark_dead(eb_EventBus *bus, eb_EventType type, size_t idx) {
-    SubscriptionVec *v = &bus->subs[type];
+static void mark_dead(teb_EventBus *self, teb_EventType type, size_t idx) {
+    SubscriptionVec *v = &self->subs[type];
     assert(v->data[idx].handler);
 
     v->data[idx].handler = nullptr;
     v->data[idx].ctx = nullptr;
     ++v->dead;
-    ++bus->total_dead;
+    ++self->total_dead;
 }
 
-static void compact_type(eb_EventBus *bus, eb_EventType type) {
-    assert(bus->dispatch_depth == 0);
+static void compact_type(teb_EventBus *self, teb_EventType type) {
+    assert(self->dispatch_depth == 0);
 
-    SubscriptionVec *v = &bus->subs[type];
+    SubscriptionVec *v = &self->subs[type];
 
     const size_t dead = v->dead;
     if (dead == 0) {
@@ -583,21 +583,21 @@ static void compact_type(eb_EventBus *bus, eb_EventType type) {
     memset(&arr[w], 0, dead * sizeof(arr[0]));
     v->len = w;
     v->dead = 0;
-    bus->total_dead -= dead;
+    self->total_dead -= dead;
 }
 
-static void compact_all(eb_EventBus *bus) {
-    for (size_t t = 0; t < bus->event_type_count && bus->total_dead > 0; ++t) {
-        compact_type(bus, (eb_EventType) t);
+static void compact_all(teb_EventBus *self) {
+    for (size_t t = 0; t < self->type_count && self->total_dead > 0; ++t) {
+        compact_type(self, (teb_EventType) t);
     }
 }
 
-static bool queue_alloc(eb_EventBus *bus) {
-    PostQueue *q = &bus->queue;
+static bool queue_alloc(teb_EventBus *self) {
+    PostQueue *q = &self->queue;
     assert(!q->headers);
     assert(q->stride % alignof(max_align_t) == 0); // what keeps every slot aligned
 
-    // neither product can overflow: both were checked in eb_bus_create_ex. Not
+    // neither product can overflow: both were checked in teb_event_bus_new_cap. Not
     // zeroed either -- a slot is written whole before it is ever read, and
     // zeroing would touch every page of a buffer most buses never fill
     q->headers = malloc(q->cap * sizeof(*q->headers));

@@ -1,6 +1,6 @@
-# C Event Bus
+# teb — terse event bus
 
-[![ci](https://github.com/twist347/c_event_bus/actions/workflows/ci.yml/badge.svg)](https://github.com/twist347/c_event_bus/actions/workflows/ci.yml)
+[![ci](https://github.com/twist347/terse-eventbus/actions/workflows/ci.yml/badge.svg)](https://github.com/twist347/terse-eventbus/actions/workflows/ci.yml)
 
 A tiny synchronous event bus for **C23** (callable from **C++20**).  
 FIFO delivery, safe subscribe/unsubscribe even from inside handlers, and an
@@ -14,9 +14,9 @@ optional deferred queue for work that must wait until the frame settles.
 - **FIFO order**: handlers are invoked in registration order.
 - **Mutation-safe dispatch**: unsubscribing inside a handler takes effect immediately; subscribing never feeds the event in flight.
 - **Zero-copy payloads**: pass a pointer + size; no allocations in the hot path.
-- **No subscriber cap**: the per-type list grows on demand, with `eb_bus_reserve`
-  to pre-allocate and `eb_bus_shrink_to_fit` to hand memory back.
-- **Queue sized per bus**: `eb_bus_create_ex` takes the post slot size and queue
+- **No subscriber cap**: the per-type list grows on demand, with `teb_event_bus_reserve`
+  to pre-allocate and `teb_event_bus_shrink_to_fit` to hand memory back.
+- **Queue sized per bus**: `teb_event_bus_new_cap` takes the post slot size and queue
   depth, so a consumer picks them without editing the header.
 - **C++ friendly**: functions are `extern "C"`.
 - **No deps** beyond the standard library.
@@ -30,43 +30,43 @@ optional deferred queue for work that must wait until the frame settles.
   the moved array.
 - **Single-threaded.** No internal locking — call from one thread only.
 - **Bounded recursion.** Nested publishes are capped at
-  `EB_MAX_DISPATCH_DEPTH` levels (default 32). Hitting the cap drops
+  `TEB_MAX_DISPATCH_DEPTH` levels (default 32). Hitting the cap drops
   the event and asserts in debug builds.
 - **`publish` borrows the payload, `post` copies it.** A posted payload outlives
   the caller's frame, so it has to be copied, and it is capped at the bus's post
-  slot size (`EB_DEFAULT_POST_PAYLOAD`, 64 bytes, unless `eb_bus_create_ex` says
+  slot size (`TEB_DEFAULT_POST_SLOT_SIZE`, 64 bytes, unless `teb_event_bus_new_cap` says
   otherwise) — going over drops the event and asserts in debug builds. This is
   the one asymmetry between the two paths.
 - **A queue slot is aligned for `max_align_t`, no further.** A type needing
   stricter alignment (SIMD vectors, cache-line-padded structs) cannot go through
-  `post`; `EB_POST` refuses to compile, and `eb_post_data` has no way to notice.
+  `post`; `TEB_EVENT_BUS_POST_DATA` refuses to compile, and `teb_event_bus_post_data` has no way to notice.
   `publish` carries such a payload fine — it borrows your object rather than
   copying into a slot.
 - **`drain` handles the events queued as of entry**, never more. A post made
   from a handler waits for the next drain, so two handlers posting to each other
   cannot keep a drain alive. `drain` is not callable from any handler, and
-  `drop_posted` not from inside a drain; both do nothing and assert in debug
+  `clear_posted` not from inside a drain; both do nothing and assert in debug
   builds.
 
 ## Complexity & memory
 - `subscribe` / `unsubscribe` / `publish`: **O(n)** in handlers per type.
 - `subscribe` is amortized O(1) past the duplicate check: capacity doubles from 4.
-- A bus costs `event_type_count` empty vectors up front; slots are allocated per
-  type on first subscribe. Vectors never shrink — compaction and `eb_bus_reset`
+- A bus costs `type_count` empty vectors up front; slots are allocated per
+  type on first subscribe. Vectors never shrink — compaction and `teb_event_bus_clear`
   reclaim slots but keep the capacity.
 - Dead slots are swept only once the outermost dispatch returns, so heavy
   subscribe/unsubscribe churn *inside* a single dispatch grows a vector by the
-  churn rather than by the live count. `eb_bus_shrink_to_fit` is the way back.
-- The post queue is a ring of fixed-size slots — `EB_DEFAULT_POST_QUEUE_CAP` of
-  them at `EB_DEFAULT_POST_PAYLOAD` bytes each, about 20 KB, unless
-  `eb_bus_create_ex` picks other sizes. It is allocated on the first `post`, so
+  churn rather than by the live count. `teb_event_bus_shrink_to_fit` is the way back.
+- The post queue is a ring of fixed-size slots — `TEB_DEFAULT_POST_QUEUE_CAP` of
+  them at `TEB_DEFAULT_POST_SLOT_SIZE` bytes each, about 20 KB, unless
+  `teb_event_bus_new_cap` picks other sizes. It is allocated on the first `post`, so
   a bus that never posts never pays, and `post` and `drain` never allocate. A
   full queue makes `post` return `false`; during a drain one slot is held by the
   event in flight.
 - Slot payloads are strided up to `max_align_t`, so a 40-byte slot really costs
-  48. `eb_bus_create_ex(n, 0, cap)` allocates no payload storage at all, which
+  48. `teb_event_bus_new_cap(n, 0, cap)` allocates no payload storage at all, which
   is what you want for a bus that only carries signals.
-- `eb_bus_reserve(bus, type, n)` up front makes the following `n` subscribes
+- `teb_event_bus_reserve(bus, type, n)` up front makes the following `n` subscribes
   allocation-free, which is what you want if the bus must not allocate after
   init. It is not a speed knob — doubling already costs ~6 reallocs to reach 100
   subscribers, all of them at startup.
@@ -76,7 +76,7 @@ optional deferred queue for work that must wait until the frame settles.
 ### Immediate
 
 ```c
-#include "eb/event_bus.h"
+#include "teb/event_bus.h"
 #include <stdio.h>
 
 typedef enum : int32_t {
@@ -87,25 +87,25 @@ typedef enum : int32_t {
 
 typedef struct { int hp; } DamageEvt;
 
-void on_player_damaged(const eb_Event *ev, eb_EventBus *bus, void *ctx) {
+void on_player_damaged(const teb_Event *ev, teb_EventBus *bus, void *ctx) {
     (void) bus;
     (void) ctx;
 
-    EB_EV_EXPECT(ev, DamageEvt);
-    const DamageEvt *d = EB_EV_CPTR(ev, DamageEvt);
+    TEB_EVENT_EXPECT(DamageEvt, ev);
+    const DamageEvt *d = TEB_EVENT_DATA_AS(DamageEvt, ev);
     printf("player lost %d hp\n", d->hp);
 }
 
 int main(void) {
-    eb_EventBus *bus = eb_bus_create(EV_COUNT);
+    teb_EventBus *bus = teb_event_bus_new(EV_COUNT);
 
-    [[maybe_unused]] bool ok = eb_subscribe(bus, EV_PLAYER_DAMAGED, on_player_damaged, nullptr);
+    [[maybe_unused]] bool ok = teb_event_bus_subscribe(bus, EV_PLAYER_DAMAGED, on_player_damaged, nullptr);
     assert(ok);
 
     DamageEvt d = {.hp = 5};
-    EB_PUBLISH(bus, EV_PLAYER_DAMAGED, d);
+    TEB_EVENT_BUS_PUBLISH_DATA(bus, EV_PLAYER_DAMAGED, d);
 
-    eb_bus_destroy(bus);
+    teb_event_bus_drop(bus);
 }
 ```
 
@@ -115,21 +115,21 @@ Same enum, same handler, same subscription — only the delivery changes:
 
 ```c
 int main(void) {
-    eb_EventBus *bus = eb_bus_create(EV_COUNT);
+    teb_EventBus *bus = teb_event_bus_new(EV_COUNT);
 
-    [[maybe_unused]] bool ok = eb_subscribe(bus, EV_PLAYER_DAMAGED, on_player_damaged, nullptr);
+    [[maybe_unused]] bool ok = teb_event_bus_subscribe(bus, EV_PLAYER_DAMAGED, on_player_damaged, nullptr);
     assert(ok);
 
     while (running) {
         DamageEvt d = {.hp = 5};
-        EB_POST(bus, EV_PLAYER_DAMAGED, d); // queued; d may die on the next line
+        TEB_EVENT_BUS_POST_DATA(bus, EV_PLAYER_DAMAGED, d); // queued; d may die on the next line
 
         update_the_world();
 
-        (void) eb_drain(bus); // the handler runs here, once the frame settled
+        (void) teb_event_bus_drain(bus); // the handler runs here, once the frame settled
     }
 
-    eb_bus_destroy(bus);
+    teb_event_bus_drop(bus);
 }
 ```
 
@@ -139,7 +139,7 @@ Sizing the queue for the bus instead of taking the defaults:
 
 ```c
     // 4 events deep, 32-byte payloads; refuses anything larger
-    eb_EventBus *bus = eb_bus_create_ex(EV_COUNT, 32, 4);
+    teb_EventBus *bus = teb_event_bus_new_cap(EV_COUNT, 32, 4);
 ```
 
 > Note: public API is marked `[[nodiscard]]` — don't silently drop return values.
@@ -148,63 +148,63 @@ Sizing the queue for the bus instead of taking the defaults:
 
 ## API
 
-`eb_EventType` is an `int32_t`, `eb_Event` and `eb_EventBus` are opaque, and a
-handler is an `eb_EventHandler`, i.e.
-`void (*)(const eb_Event *ev, eb_EventBus *bus, void *ctx)`.
+`teb_EventType` is an `int32_t`, `teb_Event` and `teb_EventBus` are opaque, and a
+handler is a `teb_EventHandler`, i.e.
+`void (*)(const teb_Event *ev, teb_EventBus *bus, void *ctx)`.
 
 **Event**
 
 | | |
 |---|---|
-| `eb_ev_type(ev)` | the type it was published with |
-| `eb_ev_data(ev)` / `eb_ev_data_size(ev)` | payload, borrowed for the call |
-| `EB_EV_EXPECT(ev, T)` | assert it really is a `T` |
-| `EB_EV_VAL(ev, T)` / `EB_EV_CPTR(ev, T)` | read it in place |
-| `EB_EV_LOAD(ev, T, dst)` | copy it out — the only form that outlives dispatch |
+| `teb_event_type(ev)` | the type it was published with |
+| `teb_event_data(ev)` / `teb_event_data_size(ev)` | payload, borrowed for the call |
+| `TEB_EVENT_EXPECT(T, ev)` | assert it really is a `T` |
+| `TEB_EVENT_DATA_AS(T, ev)` | read it in place, as a `const T *` |
+| `TEB_EVENT_LOAD(T, ev, dst)` | copy it out — the only form that outlives dispatch |
 
 **Bus**
 
 | | |
 |---|---|
-| `eb_bus_create(n)` | types `[0, n)`, default queue |
-| `eb_bus_create_ex(n, slot, cap)` | same, queue sized here |
-| `eb_bus_destroy(bus)` | frees it; safe on `nullptr` |
-| `eb_bus_reset(bus)` | drops subscriptions and queue, keeps the memory |
-| `eb_bus_reserve(bus, type, n)` | room for `n` subscribers up front |
-| `eb_bus_shrink_to_fit(bus)` | hand unused subscriber capacity back |
+| `teb_event_bus_new(n)` | types `[0, n)`, default queue |
+| `teb_event_bus_new_cap(n, slot, cap)` | same, queue sized here |
+| `teb_event_bus_drop(bus)` | frees it; safe on `nullptr` |
+| `teb_event_bus_clear(bus)` | drops subscriptions and queue, keeps the memory |
+| `teb_event_bus_reserve(bus, type, cap)` | room for `cap` subscribers up front |
+| `teb_event_bus_shrink_to_fit(bus)` | hand unused subscriber capacity back |
 
 **Subscriptions**
 
 | | |
 |---|---|
-| `eb_subscribe(bus, type, h, ctx)` | register; duplicate pairs rejected |
-| `eb_unsubscribe(bus, type, h, ctx)` | remove one |
-| `eb_unsubscribe_by_type(bus, type)` | remove all on a type |
-| `eb_unsubscribe_by_ctx(bus, ctx)` | remove by ctx, returns how many |
-| `eb_unsubscribe_by_handler(bus, h)` | remove by handler, returns how many |
-| `eb_count_subscribers(bus, type)` | live handlers on a type |
-| `EB_CTX_EXPECT/VAL/PTR/CPTR(ctx, T)` | the `EB_EV_` macros, for `ctx` |
+| `teb_event_bus_subscribe(bus, type, h, ctx)` | register; duplicate pairs rejected |
+| `teb_event_bus_unsubscribe(bus, type, h, ctx)` | remove one |
+| `teb_event_bus_unsubscribe_type(bus, type)` | remove all on a type |
+| `teb_event_bus_unsubscribe_ctx(bus, ctx)` | remove by ctx, returns how many |
+| `teb_event_bus_unsubscribe_handler(bus, h)` | remove by handler, returns how many |
+| `teb_event_bus_count_subscribers(bus, type)` | live handlers on a type |
+| `TEB_CTX_EXPECT(T, ctx)` / `TEB_CTX_AS(T, ctx)` / `TEB_CTX_MUT_AS(T, ctx)` | the same, for `ctx` |
 
 **Publish — now**
 
 | | |
 |---|---|
-| `eb_publish_data(bus, type, data, size)` | run every handler; payload borrowed |
-| `eb_publish(bus, type)` | same, no payload |
-| `EB_PUBLISH(bus, type, expr)` | publish a copy of `expr` |
-| `EB_MAX_DISPATCH_DEPTH` | nesting cap, 32 |
+| `teb_event_bus_publish_data(bus, type, data, size)` | run every handler; payload borrowed |
+| `teb_event_bus_publish(bus, type)` | same, no payload |
+| `TEB_EVENT_BUS_PUBLISH_DATA(bus, type, expr)` | publish a copy of `expr` |
+| `TEB_MAX_DISPATCH_DEPTH` | nesting cap, 32 |
 
 **Publish — later**
 
 | | |
 |---|---|
-| `eb_post_data(bus, type, data, size)` | queue it; payload **copied** |
-| `eb_post(bus, type)` | same, no payload |
-| `EB_POST(bus, type, expr)` | post a copy of `expr` |
-| `eb_drain(bus)` | dispatch what is queued, returns how many |
-| `eb_drop_posted(bus)` | discard the queue |
-| `eb_count_posted(bus)` | events waiting |
-| `EB_DEFAULT_POST_PAYLOAD` / `EB_DEFAULT_POST_QUEUE_CAP` | 64 B, 256 slots |
+| `teb_event_bus_post_data(bus, type, data, size)` | queue it; payload **copied** |
+| `teb_event_bus_post(bus, type)` | same, no payload |
+| `TEB_EVENT_BUS_POST_DATA(bus, type, expr)` | post a copy of `expr` |
+| `teb_event_bus_drain(bus)` | dispatch what is queued, returns how many |
+| `teb_event_bus_clear_posted(bus)` | discard the queue |
+| `teb_event_bus_count_posted(bus)` | events waiting |
+| `TEB_DEFAULT_POST_SLOT_SIZE` / `TEB_DEFAULT_POST_QUEUE_CAP` | 64 B, 256 slots |
 
 ## Requirements
 
@@ -234,10 +234,10 @@ in.
 
 Two runnable programs, one per delivery model:
 
-- `examples/immediate.c` — `eb_publish`. An enemy dies inside the damage
+- `examples/immediate.c` — `teb_event_bus_publish`. An enemy dies inside the damage
   dispatch and frees itself on the spot; the handler registered after it never
   sees the fatal hit.
-- `examples/deferred.c` — `eb_post` + `eb_drain` in a frame loop. Deaths are
+- `examples/deferred.c` — `teb_event_bus_post` + `teb_event_bus_drain` in a frame loop. Deaths are
   queued so nothing is freed while the tick dispatch is still walking the
   subscribers, and the loot a reaper posts lands one drain later, which is the
   snapshot rule in plain sight.
@@ -251,22 +251,22 @@ nothing has to be repeated on your side.
 
 ```cmake
 include(FetchContent)
-FetchContent_Declare(c_event_bus
-    GIT_REPOSITORY https://github.com/twist347/c_event_bus.git
+FetchContent_Declare(terse-eventbus
+    GIT_REPOSITORY https://github.com/twist347/terse-eventbus.git
     GIT_TAG main)
-FetchContent_MakeAvailable(c_event_bus)
+FetchContent_MakeAvailable(terse-eventbus)
 
-target_link_libraries(my_app PRIVATE eb::event_bus)
+target_link_libraries(my_app PRIVATE teb::teb)
 ```
 
 ### Submodule
 
 ```cmake
-add_subdirectory(third_party/c_event_bus)
-target_link_libraries(my_app PRIVATE eb::event_bus)
+add_subdirectory(third_party/terse-eventbus)
+target_link_libraries(my_app PRIVATE teb::teb)
 ```
 
 ### Vendoring
 
-It is one `.c` file — dropping `src/event_bus.c` and `include/eb/` straight
+It is one `.c` file — dropping `src/event_bus.c` and `include/teb/` straight
 into your own tree works too. Compile with `-std=c23`.
